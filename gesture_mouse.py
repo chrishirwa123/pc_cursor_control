@@ -6,6 +6,7 @@ Gestures (one hand, palm facing the camera):
     MOVE    : Index finger up, middle finger down      -> cursor follows index tip
     SCROLL  : Index + middle up (ring/pinky down)      -> move hand up/down to scroll
     CLICK   : Touch thumb tip to index fingertip       -> left click (pinch)
+    LOCK    : All five fingers extended, held ~1.8 s   -> locks the computer screen
 
 Keys (in the preview window):
     q  - quit
@@ -22,6 +23,8 @@ file (~8 MB) is downloaded automatically on first run.
 import math
 import os
 import platform
+import shutil
+import subprocess
 import threading
 import time
 import urllib.request
@@ -92,6 +95,13 @@ class Config:
     scroll_smooth: float = 0.5           # EMA factor for vertical delta (0..1)
     invert_scroll: bool = False          # flip direction if you prefer "natural" scrolling
 
+    # --- Screen lock gesture (all five fingers open) ---
+    lock_hold_s: float = 1.8             # gesture must be held this long (seconds)
+    lock_grace_s: float = 0.15           # tolerated tracking dropout while holding
+    lock_cooldown_s: float = 8.0         # no re-trigger for this long after a lock
+    lock_extend_margin: float = 1.15     # stricter than normal: fingers must be FULLY open
+    lock_thumb_ratio: float = 0.60       # thumb-tip to index-knuckle distance / hand size
+
 
 # =============================================================================
 # MEDIAPIPE LANDMARK INDICES
@@ -102,6 +112,8 @@ INDEX_PIP, INDEX_TIP = 6, 8
 MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP = 9, 10, 12
 RING_PIP, RING_TIP = 14, 16
 PINKY_PIP, PINKY_TIP = 18, 20
+THUMB_IP = 3
+INDEX_MCP = 5
 
 # Skeleton connections (same as MediaPipe's HAND_CONNECTIONS)
 HAND_CONNECTIONS = [
@@ -122,6 +134,8 @@ COLORS = {
     "IDLE": (170, 170, 170),
     "PAUSED": (0, 140, 255),
     "NO HAND": (120, 120, 120),
+    "LOCKING SCREEN...": (60, 60, 255),
+    "SCREEN LOCKED": (60, 60, 255),
 }
 
 
@@ -423,6 +437,164 @@ def draw_overlay(frame: np.ndarray, label: str, fps: float, cfg: Config, ratio: 
 
 
 # =============================================================================
+# SCREEN LOCK GESTURE  (all five fingers extended and held)
+# =============================================================================
+def lock_screen() -> bool:
+    """Lock the workstation using the best method for the current OS.
+    Returns True if a lock command was issued."""
+    system = platform.system()
+    try:
+        if system == "Windows":
+            import ctypes
+            # Direct API call is more reliable than injecting Win+L.
+            if ctypes.windll.user32.LockWorkStation():
+                return True
+            pyautogui.hotkey("win", "l")
+            return True
+
+        if system == "Darwin":
+            # Ctrl+Cmd+Q = Lock Screen (macOS 10.13+). Needs Accessibility permission.
+            pyautogui.hotkey("ctrl", "command", "q")
+            return True
+
+        # Linux / BSD: try the common session lockers in order.
+        commands = [
+            ["loginctl", "lock-session"],
+            ["xdg-screensaver", "lock"],
+            ["gnome-screensaver-command", "-l"],
+            ["cinnamon-screensaver-command", "-l"],
+            ["xscreensaver-command", "-lock"],
+            ["dm-tool", "lock"],
+            ["qdbus", "org.freedesktop.ScreenSaver", "/ScreenSaver", "Lock"],
+        ]
+        for cmd in commands:
+            if shutil.which(cmd[0]):
+                if subprocess.run(cmd, timeout=5, check=False).returncode == 0:
+                    return True
+    except Exception as exc:
+        print(f"[lock] failed: {exc}")
+        return False
+
+    print("[lock] no supported lock command found on this system")
+    return False
+
+
+class ScreenLockDetector:
+    """
+    Detects an open palm (all 5 fingers fully extended) held continuously for
+    `lock_hold_s` seconds, then locks the screen. After a lock the gesture must
+    be released and a cooldown must pass before it can trigger again.
+    """
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.progress = 0.0                  # 0..1 hold progress (used by the overlay)
+        self.hold_s = cfg.lock_hold_s
+        self._hold_start: Optional[float] = None
+        self._lost_since: Optional[float] = None
+        self._armed = True                   # must release the gesture before re-arming
+        self._cooldown_until = 0.0
+        self._flash_until = 0.0
+
+    @staticmethod
+    def _dist(a: np.ndarray, b: np.ndarray) -> float:
+        return float(np.hypot(a[0] - b[0], a[1] - b[1]))
+
+    def five_fingers_open(self, pts: np.ndarray) -> bool:
+        c = self.cfg
+        hand_size = max(self._dist(pts[WRIST], pts[MIDDLE_MCP]), 1e-6)
+
+        # Index, middle, ring, pinky: tip clearly farther from wrist than its PIP joint.
+        for tip, pip in ((INDEX_TIP, INDEX_PIP), (MIDDLE_TIP, MIDDLE_PIP),
+                         (RING_TIP, RING_PIP), (PINKY_TIP, PINKY_PIP)):
+            if self._dist(pts[tip], pts[WRIST]) <= self._dist(pts[pip], pts[WRIST]) * c.lock_extend_margin:
+                return False
+
+        # Thumb: splayed away from the palm (far from the index knuckle) and straight.
+        thumb_out = self._dist(pts[THUMB_TIP], pts[INDEX_MCP]) / hand_size
+        thumb_straight = self._dist(pts[THUMB_TIP], pts[INDEX_MCP]) > self._dist(pts[THUMB_IP], pts[INDEX_MCP]) * 1.1
+        return thumb_out >= c.lock_thumb_ratio and thumb_straight
+
+    def reset(self) -> None:
+        """Call when the hand is lost or control is paused."""
+        self._hold_start = None
+        self._lost_since = None
+        self.progress = 0.0
+        self._armed = True
+
+    def update(self, pts: np.ndarray, now: float) -> str:
+        """Returns "IDLE", "HOLDING" (countdown running) or "LOCKED" (just locked)."""
+        c = self.cfg
+
+        # Post-lock cooldown
+        if now < self._cooldown_until:
+            self._hold_start = None
+            self.progress = 0.0
+            return "LOCKED" if now < self._flash_until else "IDLE"
+
+        detected = self.five_fingers_open(pts)
+
+        # After a lock, the open palm must be released before it can arm again.
+        if not self._armed:
+            if not detected:
+                self._armed = True
+            return "IDLE"
+
+        if detected:
+            self._lost_since = None
+            if self._hold_start is None:
+                self._hold_start = now
+            elapsed = now - self._hold_start
+            self.progress = min(elapsed / c.lock_hold_s, 1.0)
+
+            if elapsed >= c.lock_hold_s:
+                ok = lock_screen()
+                self._hold_start = None
+                self.progress = 0.0
+                self._armed = False
+                self._cooldown_until = now + c.lock_cooldown_s
+                if ok:
+                    self._flash_until = now + 3.0
+                    return "LOCKED"
+                return "IDLE"
+            return "HOLDING"
+
+        # Gesture not detected: tolerate a brief tracking dropout, then cancel.
+        if self._hold_start is not None:
+            if self._lost_since is None:
+                self._lost_since = now
+            if now - self._lost_since <= c.lock_grace_s:
+                return "HOLDING"
+            self._hold_start = None
+            self._lost_since = None
+            self.progress = 0.0
+        return "IDLE"
+
+
+def draw_lock_overlay(frame: np.ndarray, detector: ScreenLockDetector) -> None:
+    """Big centred warning + progress bar while the lock countdown is running."""
+    if detector.progress <= 0:
+        return
+    h, w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    text = "LOCKING SCREEN..."
+    (tw, _), _ = cv2.getTextSize(text, font, 1.0, 3)
+    x, y = (w - tw) // 2, h // 2
+
+    cv2.putText(frame, text, (x, y), font, 1.0, (0, 0, 0), 6, cv2.LINE_AA)       # outline
+    cv2.putText(frame, text, (x, y), font, 1.0, (0, 0, 255), 3, cv2.LINE_AA)
+
+    bar_w = int(w * 0.6)
+    bx, by = (w - bar_w) // 2, y + 18
+    cv2.rectangle(frame, (bx, by), (bx + bar_w, by + 16), (60, 60, 60), -1)
+    cv2.rectangle(frame, (bx, by), (bx + int(bar_w * detector.progress), by + 16), (0, 0, 255), -1)
+
+    remaining = max(detector.hold_s * (1.0 - detector.progress), 0.0)
+    cv2.putText(frame, f"Hold... {remaining:.1f}s  (lower your hand to cancel)", (bx, by + 40),
+                font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 def main() -> None:
@@ -436,6 +608,7 @@ def main() -> None:
 
     screen_w, screen_h = pyautogui.size()
     controller = GestureController(cfg, screen_w, screen_h)
+    lock_detector = ScreenLockDetector(cfg)
 
     model_path = ensure_model()
     options = vision.HandLandmarkerOptions(
@@ -502,6 +675,16 @@ def main() -> None:
                     label = controller.update(pts, norm, time.perf_counter())
                 ratio = controller.pinch_ratio
 
+                # --- Screen lock gesture (five fingers open, held) ---
+                if paused:
+                    lock_detector.reset()
+                else:
+                    lock_state = lock_detector.update(pts, time.perf_counter())
+                    if lock_state == "HOLDING":
+                        label = "LOCKING SCREEN..."
+                    elif lock_state == "LOCKED":
+                        label = "SCREEN LOCKED"
+
                 # Highlight the pointer (index tip) and thumb tip
                 ix, iy = int(pts[INDEX_TIP][0]), int(pts[INDEX_TIP][1])
                 tx, ty = int(pts[THUMB_TIP][0]), int(pts[THUMB_TIP][1])
@@ -509,6 +692,7 @@ def main() -> None:
                 cv2.circle(frame, (tx, ty), 7, (255, 255, 0), cv2.FILLED)
             else:
                 controller.reset()
+                lock_detector.reset()
                 if paused:
                     label = "PAUSED"
 
@@ -519,6 +703,7 @@ def main() -> None:
             prev_t = now
 
             draw_overlay(frame, label, fps, cfg, ratio)
+            draw_lock_overlay(frame, lock_detector)
             cv2.imshow(window, frame)
 
             key = cv2.waitKey(1) & 0xFF
@@ -527,6 +712,7 @@ def main() -> None:
             if key == ord("p"):
                 paused = not paused
                 controller.reset()
+                lock_detector.reset()
 
     except KeyboardInterrupt:
         pass
